@@ -19,23 +19,29 @@ Pinecone, Weaviate, Qdrant build on top of):
 """
  
 from __future__ import annotations
-import json
-import os
 import numpy as np
 from typing import Any, Optional
- 
- 
+from enum import Enum
+
+from . import persistence
+
+class Metric(str, Enum):
+    COSINE = "cosine"
+    EUCLIDEAN = "euclidean"
+
+
+    
 class VectorDB:
-    def __init__(self, dim: int, metric: str = "cosine"):
+    def __init__(self, dim: int, metric: Metric=Metric.COSINE):
         """
         dim: dimensionality of vectors you'll store (must be fixed and known upfront)
         metric: "cosine" or "euclidean"
         """
-        if metric not in ("cosine", "euclidean"):
+        if metric not in (Metric.COSINE, Metric.EUCLIDEAN):
             raise ValueError("metric must be 'cosine' or 'euclidean'")
  
         self.dim = dim
-        self.metric = metric
+        self.metric = Metric(metric)
  
         # Vectors stored as rows of a single numpy array. We over-allocate
         # and grow geometrically (like a python list / C++ vector) instead
@@ -70,7 +76,7 @@ class VectorDB:
  
     def add(self, id: str, vector: np.ndarray, metadata: Optional[dict] = None):
         if id in self._id_to_row:
-            raise ValueError(f"id '{id}' already exists, use update() or delete() first")
+            raise ValueError(f"id '{id}' already exists, use update() or delete() it first")
  
         vector = np.asarray(vector, dtype=np.float32)
         if vector.shape != (self.dim,):
@@ -92,6 +98,25 @@ class VectorDB:
         for id, vec, meta in zip(ids, vectors, metadatas):
             self.add(id, vec, meta)
  
+    def update(self, id: str, vector: Optional[np.ndarray] = None, metadata: Optional[dict] = None):
+        """
+        Updates an existing id in place (row index and insertion order stay
+        the same). Pass only `vector`, only `metadata`, or both.
+        """
+        if id not in self._id_to_row:
+            raise KeyError(f"id '{id}' not found")
+
+        if vector is not None:
+            vector = np.asarray(vector, dtype=np.float32)
+            if vector.shape != (self.dim,):
+                raise ValueError(f"expected vector of shape ({self.dim},), got {vector.shape}")
+            row = self._id_to_row[id]
+            self._vectors[row] = vector
+            self._norms[row] = np.linalg.norm(vector) or 1e-10
+
+        if metadata is not None:
+            self._metadata[id] = metadata
+
     def delete(self, id: str):
         """
         Deletes by swapping the last row into the deleted row's place
@@ -157,21 +182,18 @@ class VectorDB:
  
     def save(self, path: str):
         """Saves to `<path>.npy` (vectors) and `<path>.json` (ids + metadata)."""
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        np.save(path + ".npy", self._vectors[: self._size])
-        with open(path + ".json", "w") as f:
-            json.dump({
-                "dim": self.dim,
-                "metric": self.metric,
-                "ids": self._ids,
-                "metadata": self._metadata,
-            }, f)
- 
+        persistence.save_to_disk(
+            path,
+            self._vectors[: self._size],
+            self.dim,
+            self.metric.value,
+            self._ids,
+            self._metadata,
+        )
+
     @classmethod
     def load(cls, path: str) -> "VectorDB":
-        with open(path + ".json") as f:
-            data = json.load(f)
-        db = cls(dim=data["dim"], metric=data["metric"])
-        vectors = np.load(path + ".npy")
-        db.add_batch(data["ids"], vectors, [data["metadata"][id] for id in data["ids"]])
+        vectors, dim, metric, ids, metadata = persistence.load_from_disk(path)
+        db = cls(dim=dim, metric=metric)
+        db.add_batch(ids, vectors, [metadata[id] for id in ids])
         return db
