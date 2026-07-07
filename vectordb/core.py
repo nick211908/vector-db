@@ -140,36 +140,63 @@ class VectorDB:
         del self._metadata[id]
         self._size -= 1
  
-    def search(self, query: np.ndarray, k: int = 5) -> list[tuple[str, float, dict]]:
+    def search(
+        self,
+        query: np.ndarray,
+        k: int = 5,
+        where: Optional[dict | Any] = None,
+    ) -> list[tuple[str, float, dict]]:
         """
         Brute-force search: compare query against every stored vector at once.
         Returns [(id, score, metadata), ...] sorted best-first.
         For cosine: score = similarity (higher is better, range -1 to 1).
         For euclidean: score = distance (lower is better).
+
+        where: optional metadata filter, applied before ranking.
+          - dict: equality filter, e.g. {"label": "x"} keeps rows where
+            metadata["label"] == "x" (all key/value pairs must match).
+          - callable: predicate metadata -> bool for arbitrary filters.
         """
         if self._size == 0:
             return []
- 
+
         query = np.asarray(query, dtype=np.float32)
-        active = self._vectors[: self._size]  # only the filled rows
- 
+
+        if where is None:
+            rows = np.arange(self._size)
+        else:
+            rows = np.array(
+                [row for row in range(self._size) if self._matches(self._ids[row], where)]
+            )
+            if rows.size == 0:
+                return []
+
+        active = self._vectors[rows]
+
         if self.metric == "cosine":
             query_norm = np.linalg.norm(query) or 1e-10
             # dot product of query with every row = matrix-vector multiply
             dots = active @ query
-            scores = dots / (self._norms[: self._size] * query_norm)
+            scores = dots / (self._norms[rows] * query_norm)
             order = np.argsort(-scores)[:k]  # descending
         else:  # euclidean
             diffs = active - query
             dists = np.linalg.norm(diffs, axis=1)
             scores = dists
             order = np.argsort(scores)[:k]  # ascending
- 
+
         results = []
-        for row in order:
+        for i in order:
+            row = rows[i]
             id = self._ids[row]
-            results.append((id, float(scores[row]), self._metadata[id]))
+            results.append((id, float(scores[i]), self._metadata[id]))
         return results
+
+    def _matches(self, id: str, where: dict | Any) -> bool:
+        metadata = self._metadata[id]
+        if callable(where):
+            return bool(where(metadata))
+        return all(metadata.get(key) == value for key, value in where.items())
  
     def get(self, id: str) -> tuple[np.ndarray, dict]:
         row = self._id_to_row[id]

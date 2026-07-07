@@ -53,6 +53,10 @@ results = db.search(np.array([1, 0, 0]), k=2)
 # cosine: higher score = better match (range -1 to 1)
 # euclidean: lower score = better match
 
+# filter before ranking: dict (equality on all keys) or a predicate callable
+db.search(np.array([1, 0, 0]), k=2, where={"label": "x-axis"})
+db.search(np.array([1, 0, 0]), k=2, where=lambda m: m["label"].startswith("x"))
+
 db.update("a", metadata={"label": "x-axis (renamed)"})
 db.delete("b")
 
@@ -70,7 +74,7 @@ db2 = VectorDB.load("data/my_db")
 | `add_batch(ids, vectors, metadatas=None)` | Insert many at once. |
 | `update(id, vector=None, metadata=None)` | Update an existing id's vector and/or metadata in place. Raises `KeyError` if `id` doesn't exist. |
 | `delete(id)` | Remove an id (O(1), swap-with-last-row). |
-| `search(query, k=5)` | Return the `k` nearest `(id, score, metadata)` tuples. |
+| `search(query, k=5, where=None)` | Return the `k` nearest `(id, score, metadata)` tuples. `where` filters by metadata before ranking: a dict for equality matching, or a callable predicate. |
 | `get(id)` | Return `(vector, metadata)` for a single id. |
 | `save(path)` / `VectorDB.load(path)` | Persist to / restore from `<path>.npy` + `<path>.json`. |
 | `len(db)` | Number of stored vectors. |
@@ -97,12 +101,11 @@ search logic.
 ## Status
 
 Working: add / add_batch / update / delete / get, cosine + euclidean
-search, save/load round-tripping, a `Metric` string-enum for the metric
-type.
+search, metadata filtering (`where=`) during search, save/load
+round-tripping, a `Metric` string-enum for the metric type.
 
 Not yet implemented:
 
-- Metadata filtering during `search()` (equality or predicate-based)
 - `vectordb/__init__.py` exports (`from vectordb import VectorDB`)
 - `tests/` (add/delete re-indexing, search correctness, filtering,
   persistence round-trip)
