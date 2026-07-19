@@ -1,9 +1,14 @@
 # vectordb
 
 A minimal vector database built from scratch with only NumPy — no FAISS, no
-external ANN library. It's a **flat index**: brute-force O(n) search per
-query, exact (not approximate) results. That's the right tradeoff up to
-roughly 100k–500k vectors on a single machine.
+external ANN library. It ships two search paths so you can compare them
+directly:
+
+- a **flat index** — brute-force O(n) search per query, exact results (the
+  right tradeoff up to roughly 100k–500k vectors on a single machine), and
+- an **IVF (inverted-file) index** — approximate search that clusters the
+  vectors with from-scratch k-means and scans only the nearest few cells per
+  query, trading a little recall for a large speedup.
 
 ## Why
 
@@ -21,6 +26,12 @@ visible instead of hidden behind a library:
 4. **Mutation** — deletes swap the last row into the deleted slot (O(1))
    instead of shifting the whole array.
 5. **Persistence** — vectors saved as `.npy`, metadata/ids/config as `.json`.
+6. **Approximate search (IVF)** — an optional inverted-file index. k-means
+   (written from scratch, `ivf.py`) learns `nlist` centroids; every vector is
+   filed under its nearest one. A query scans only the `nprobe` nearest cells
+   instead of all N — trading exactness for a large speedup. This is the same
+   idea as FAISS's `IndexIVFFlat`. Exact search is untouched; IVF is additive
+   so the two can be compared directly (see the benchmark in `main.py`).
 
 ## Install
 
@@ -64,6 +75,22 @@ db.save("data/my_db")           # writes data/my_db.npy + data/my_db.json
 db2 = VectorDB.load("data/my_db")
 ```
 
+### Approximate search (IVF)
+
+For larger datasets, train an IVF index once and search it instead of
+scanning every vector:
+
+```python
+db.build_index(nlist=128, nprobe=4)   # k-means training; one-shot snapshot
+db.search(query, k=10, use_index=True)  # scans only the nprobe nearest cells
+```
+
+`nprobe` is the recall/speed knob: higher scans more cells (better recall,
+slower); `nprobe == nlist` degenerates to exact search. Any
+`add`/`update`/`delete` marks the index stale — call `build_index()` again
+before the next `use_index=True` search or it raises. Run `python main.py` to
+see the recall-vs-speed tradeoff on clustered synthetic data.
+
 ## API
 
 `VectorDB(dim, metric=Metric.COSINE)`
@@ -74,7 +101,8 @@ db2 = VectorDB.load("data/my_db")
 | `add_batch(ids, vectors, metadatas=None)` | Insert many at once. |
 | `update(id, vector=None, metadata=None)` | Update an existing id's vector and/or metadata in place. Raises `KeyError` if `id` doesn't exist. |
 | `delete(id)` | Remove an id (O(1), swap-with-last-row). |
-| `search(query, k=5, where=None)` | Return the `k` nearest `(id, score, metadata)` tuples. `where` filters by metadata before ranking: a dict for equality matching, or a callable predicate. |
+| `search(query, k=5, where=None, use_index=False)` | Return the `k` nearest `(id, score, metadata)` tuples. `where` filters by metadata before ranking: a dict for equality matching, or a callable predicate. `use_index=True` uses the IVF index (approximate); requires a fresh `build_index()`. |
+| `build_index(nlist=None, nprobe=1, iters=10, seed=0)` | Train an IVF index over the current vectors. `nlist` defaults to ~`sqrt(size)`. Enables `search(..., use_index=True)`. |
 | `get(id)` | Return `(vector, metadata)` for a single id. |
 | `save(path)` / `VectorDB.load(path)` | Persist to / restore from `<path>.npy` + `<path>.json`. |
 | `len(db)` | Number of stored vectors. |
@@ -85,6 +113,7 @@ db2 = VectorDB.load("data/my_db")
 vector_db/
 ├── vectordb/
 │   ├── core.py          # VectorDB class: storage, mutation, search
+│   ├── ivf.py           # kmeans + IVFIndex (approximate search, from scratch)
 │   ├── persistence.py   # save/load file-format logic (kept separate from core)
 │   ├── results.py       # SearchResult dataclass
 │   └── __init__.py      # (not yet wired up — see Roadmap)
@@ -102,16 +131,18 @@ search logic.
 
 Working: add / add_batch / update / delete / get, cosine + euclidean
 search, metadata filtering (`where=`) during search, save/load
-round-tripping, a `Metric` string-enum for the metric type.
+round-tripping, a `Metric` string-enum for the metric type, and an IVF
+approximate index (`build_index()` + `search(..., use_index=True)`) with a
+recall-vs-speed benchmark in `main.py`.
 
 Not yet implemented:
 
 - `vectordb/__init__.py` exports (`from vectordb import VectorDB`)
 - `tests/` (add/delete re-indexing, search correctness, filtering,
-  persistence round-trip)
+  persistence round-trip, IVF recall)
 - `examples/` demo script
-- Approximate nearest-neighbor search (LSH/HNSW/IVF) for datasets beyond
-  what brute force can handle
+- Persisting a trained IVF index to disk (currently rebuilt after `load()`)
+- Other ANN indexes (LSH / HNSW) for comparison
 
 ## Not a goal
 

@@ -1,0 +1,1 @@
+{"dim": 3, "metric": "cosine", "ids": ["a", "d", "c"], "metadata": {"a": {"label": "x-axis (renamed)"}, "c": {"label": "z-axis"}, "d": {"label": "diagonal"}}}

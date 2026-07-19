@@ -24,6 +24,8 @@ from typing import Any, Optional
 from enum import Enum
 
 from . import persistence
+from .ivf import IVFIndex
+from .ivf import IVFIndex
 
 class Metric(str, Enum):
     COSINE = "cosine"
@@ -57,6 +59,12 @@ class VectorDB:
         # Precomputed norms for cosine similarity (avoids recomputing on
         # every search -- classic space/time tradeoff).
         self._norms = np.zeros(self._capacity, dtype=np.float32)
+
+        # Optional IVF index (approximate search). None until build_index() is
+        # called. Any mutation marks it stale so a stale index is never trusted
+        # -- it's a snapshot of the vectors at build time, not a live view.
+        self._index: Optional[IVFIndex] = None
+        self._index_trained = False
  
     # ---------- internal helpers ----------
  
@@ -92,6 +100,7 @@ class VectorDB:
         self._id_to_row[id] = row
         self._metadata[id] = metadata or {}
         self._size += 1
+        self._index_trained = False  # vectors changed -> index is now stale
  
     def add_batch(self, ids: list[str], vectors: np.ndarray, metadatas: Optional[list[dict]] = None):
         metadatas = metadatas or [None] * len(ids)
@@ -117,6 +126,9 @@ class VectorDB:
         if metadata is not None:
             self._metadata[id] = metadata
 
+        if vector is not None:
+            self._index_trained = False  # a moved vector invalidates the index
+
     def delete(self, id: str):
         """
         Deletes by swapping the last row into the deleted row's place
@@ -139,18 +151,76 @@ class VectorDB:
         del self._id_to_row[id]
         del self._metadata[id]
         self._size -= 1
- 
+        # swap-with-last shuffles row indices, so the index's row lists no
+        # longer point where they should -- mark it stale.
+        self._index_trained = False
+
+    def build_index(
+        self,
+        nlist: Optional[int] = None,
+        nprobe: int = 1,
+        iters: int = 10,
+        seed: int = 0,
+    ):
+        """
+        Train an IVF (inverted-file) index over the current vectors, enabling
+        approximate search via `search(..., use_index=True)`.
+
+        This is an explicit, one-shot training step (like FAISS's index.train):
+        it runs k-means to learn `nlist` centroids, then files every vector
+        under its nearest centroid. It's a *snapshot* -- any later
+        add/update/delete marks the index stale, and you must call
+        build_index() again before approximate search will run.
+
+        nlist:  number of clusters/cells. Defaults to ~sqrt(size), the usual
+                rule of thumb. More cells = fewer vectors scanned per probe.
+        nprobe: how many nearest cells to scan per query (the recall/speed
+                knob). 1 is fastest/loosest; nprobe == nlist degenerates to
+                exact search over everything.
+        iters:  k-means iterations.
+        """
+        if self._size == 0:
+            raise ValueError("cannot build an index over an empty database")
+
+        if nlist is None:
+            nlist = max(1, int(np.sqrt(self._size)))
+        nlist = min(nlist, self._size)
+        nprobe = min(nprobe, nlist)
+
+        self._index = IVFIndex(
+            self._vectors[: self._size],
+            nlist=nlist,
+            nprobe=nprobe,
+            iters=iters,
+            normalize=(self.metric == Metric.COSINE),
+            seed=seed,
+        )
+        self._index_trained = True
+
     def search(
         self,
         query: np.ndarray,
         k: int = 5,
         where: Optional[dict | Any] = None,
+        use_index: bool = False,
     ) -> list[tuple[str, float, dict]]:
         """
-        Brute-force search: compare query against every stored vector at once.
+        Search for the k nearest vectors to `query`.
         Returns [(id, score, metadata), ...] sorted best-first.
         For cosine: score = similarity (higher is better, range -1 to 1).
         For euclidean: score = distance (lower is better).
+
+        use_index:
+          - False (default): exact brute-force -- compare the query against
+            every stored vector at once. O(N), always correct.
+          - True: approximate -- use the IVF index to score only the vectors
+            in the nprobe nearest cells (much faster on large N, may miss a
+            true neighbor). Requires a fresh build_index(); raises if the
+            index is missing or stale.
+
+        Either way the *scoring* is identical exact math; use_index only
+        changes which candidate rows get scored. That's what makes the two
+        paths directly comparable (see main.py's recall benchmark).
 
         where: optional metadata filter, applied before ranking.
           - dict: equality filter, e.g. {"label": "x"} keeps rows where
@@ -162,14 +232,25 @@ class VectorDB:
 
         query = np.asarray(query, dtype=np.float32)
 
-        if where is None:
+        # Step 1: decide the candidate rows to score.
+        if use_index:
+            if self._index is None or not self._index_trained:
+                raise RuntimeError(
+                    "no fresh IVF index -- call build_index() first "
+                    "(a mutation may have marked a previous index stale)"
+                )
+            rows = self._index.candidates(query)
+            if where is not None:
+                rows = np.array([r for r in rows if self._matches(self._ids[r], where)])
+        elif where is None:
             rows = np.arange(self._size)
         else:
             rows = np.array(
                 [row for row in range(self._size) if self._matches(self._ids[row], where)]
             )
-            if rows.size == 0:
-                return []
+
+        if rows.size == 0:
+            return []
 
         active = self._vectors[rows]
 
